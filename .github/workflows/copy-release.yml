@@ -398,10 +398,6 @@ jobs:
           OUT="${RUNNER_TEMP}/docker-direct-versions.json"
           REQUESTED="${RUNNER_TEMP}/docker-direct-tags.txt"
           :>"${REQUESTED}"
-
-          # none 模式允许每个 image_mappings 源镜像自带独立 Tag。
-          # 所有映射都自带 Tag 时，公共 tag/tag_list 可以为空，先放一个内部占位版本，
-          # copy-docker 会对每条映射使用其自身 Tag，不会交叉组合。
           EMBEDDED_TOTAL=0
           MAPPING_TOTAL=0
           if [ -n "${IMAGE_MAPPINGS}" ]; then
@@ -415,7 +411,6 @@ jobs:
               if [[ "${last}" == *:* ]]; then EMBEDDED_TOTAL=$((EMBEDDED_TOTAL+1)); fi
             done < <(printf '%s\n' "${IMAGE_MAPPINGS}" | sed 's/；/;/g; s/;/\n/g' | sed '/^[[:space:]]*$/d')
           fi
-
           case "${COPY_MODE}" in
             single)
               if [ -n "${SINGLE_TAG}" ]; then
@@ -427,10 +422,8 @@ jobs:
                 printf '%s\n' '__mapping_tag__' > "${REQUESTED}"
                 echo "所有 Docker 映射均自带独立 Tag，公共 tag/tag_list 允许为空。"
               else
-                echo "::error::none + single 必须填写 tag，或者确保每个 Docker 源地址都自带 Tag"
-                exit 1
-              fi
-              ;;
+                echo "::error::none + single 必须填写 tag，或者确保每个 Docker 源地址都自带 Tag"; exit 1
+              fi;;
             multiple)
               if [ -n "${TAG_LIST}" ]; then
                 printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
@@ -441,14 +434,9 @@ jobs:
                 printf '%s\n' '__mapping_tag__' > "${REQUESTED}"
                 echo "所有 Docker 映射均自带独立 Tag，公共 tag/tag_list 允许为空。"
               else
-                echo "::error::none + multiple 必须填写 tag_list，或者确保每个 Docker 源地址都自带 Tag"
-                exit 1
-              fi
-              ;;
-            *)
-              echo "::error::none 模式仅支持 single 或 multiple"
-              exit 1
-              ;;
+                echo "::error::none + multiple 必须填写 tag_list，或者确保每个 Docker 源地址都自带 Tag"; exit 1
+              fi;;
+            *) echo "::error::none 模式仅支持 single 或 multiple"; exit 1;;
           esac
           [ -s "${REQUESTED}" ] || { echo "::error::没有有效的 Docker Tag"; exit 1; }
           jq -R -s 'split("\n") | map(select(length>0)) | map({tagName:.,name:.,publishedAt:null,createdAt:null,isDraft:false,isPrerelease:false})' "${REQUESTED}" > "${OUT}"
@@ -1293,26 +1281,19 @@ jobs:
               src="$(printf '%s' "${src}"|xargs)"; name="$(printf '%s' "${name}"|xargs)"
               [ -n "${src}" ] && [ -n "${name}" ] || { echo "::error::Docker 映射格式错误：${mapping}"; exit 1; }
               [[ "${src}" != *"@"* ]] || { echo "::error::源镜像不能包含 Digest"; exit 1; }
-
               mapping_tag=""
               source_last="${src##*/}"
               if [[ "${source_last}" == *:* ]]; then
-                mapping_tag="${source_last##*:}"
-                src="${src%:*}"
+                mapping_tag="${source_last##*:}"; src="${src%:*}"
                 [ -n "${mapping_tag}" ] || { echo "::error::源镜像 Tag 不能为空：${mapping}"; exit 1; }
               fi
-
-              # 补全 Docker Hub 短地址：redis -> docker.io/library/redis；
-              # pgvector/pgvector -> docker.io/pgvector/pgvector。
               first_part="${src%%/*}"
               if [[ "${src}" != */* ]]; then
                 src="docker.io/library/${src}"
               elif [[ "${first_part}" != *.* && "${first_part}" != *:* && "${first_part}" != "localhost" ]]; then
                 src="docker.io/${src}"
               fi
-
-              # 第三列是 Package/自动发现 Tag 列表，第四列是该手动映射独立 Tag。
-              printf '%s\t%s\t\t%s\n' "${src,,}" "${name,,}" "${mapping_tag}" >> "${MAP}"
+              printf '%s\t%s\t%s\t%s\n' "${src,,}" "${name,,}" '__no_package_tags__' "${mapping_tag}" >> "${MAP}"
               if [ -n "${mapping_tag}" ]; then
                 echo "独立 Tag 映射：${src,,}:${mapping_tag} -> ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name,,}:${mapping_tag}"
               fi
@@ -1343,7 +1324,12 @@ jobs:
             while IFS=$'\t' read -r registry username password; do [ -n "${registry}" ] && login_one "${registry}" "${username}" "${password}"; done < "${AUTH_MAP}"
           elif [ -n "${SOURCE_USERNAME}" ] || [ -n "${SOURCE_TOKEN}" ]; then
             [ -n "${SOURCE_USERNAME}" ] && [ -n "${SOURCE_TOKEN}" ] || { echo "::error::SOURCE_REGISTRY_USERNAME 和 SOURCE_REGISTRY_TOKEN 必须同时设置"; exit 1; }
-            while IFS= read -r registry; do [ -n "${registry}" ] && login_one "${registry}" "${SOURCE_USERNAME}" "${SOURCE_TOKEN}"; done < <(cut -f1 "${MAP}"|awk -F/ '{print $1}'|sort -u)
+            if cut -f1 "${MAP}" | awk -F/ '{print $1}' | grep -Fxq 'docker.io'; then
+              login_one "docker.io" "${SOURCE_USERNAME}" "${SOURCE_TOKEN}"
+              echo "全局 SOURCE_REGISTRY_USERNAME/TOKEN 仅应用于 docker.io；其他 Registry 保持匿名，或使用映射内独立账号。"
+            else
+              echo "映射中没有 docker.io，未使用全局 SOURCE_REGISTRY_USERNAME/TOKEN。"
+            fi
           else
             echo "未提供源镜像仓库账号，使用匿名访问。"
           fi
@@ -1372,7 +1358,7 @@ jobs:
             if [ -n "${mapping_tag:-}" ]; then
               printf '%s\n' "${mapping_tag}" > "${TAG_FILE}"
               echo "${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
-            elif [ -n "${package_tags:-}" ]; then
+            elif [ -n "${package_tags:-}" ] && [ "${package_tags}" != '__no_package_tags__' ]; then
               printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
               echo "${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
             else
@@ -1386,13 +1372,39 @@ jobs:
               CANDIDATES=()
               if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}" "${release_tag}");
               else CANDIDATES+=("${release_tag}"); if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi; fi
-              source_ref=""; checked=""
+              source_ref=""; checked=""; probe_errors=""; only_not_found=true
               for candidate in "${CANDIDATES[@]}"; do
                 ref="${source_image}:${candidate}"; checked="${checked:+${checked}, }${ref}"
-                if crane manifest "${ref}" >/dev/null 2>&1; then source_ref="${ref}"; break; fi
+                PROBE_FILE="${RUNNER_TEMP}/crane-source-probe.txt"
+                if crane manifest "${ref}" > /dev/null 2>"${PROBE_FILE}"; then
+                  source_ref="${ref}"; break
+                fi
+                probe_message="$(tr '\n' ' ' < "${PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                [ -n "${probe_message}" ] || probe_message="crane manifest 未返回错误文本"
+                echo "::warning::源镜像检查失败：${ref} | ${probe_message}"
+                probe_errors="${probe_errors}${probe_errors:+ | }${ref}: ${probe_message}"
+                if ! printf '%s' "${probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                  only_not_found=false
+                fi
               done
-              if [ -z "${source_ref}" ]; then echo "缺失（已匹配）：${checked}" >> "${SUMMARY}"; MISSING=$((MISSING+1)); continue; fi
-              if [ "${SKIP_EXISTING}" = true ] && crane manifest "${target_ref}" >/dev/null 2>&1; then echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"; last="${source_ref}"; SKIP=$((SKIP+1)); continue; fi
+              if [ -z "${source_ref}" ]; then
+                if [ "${only_not_found}" = true ]; then
+                  echo "源镜像确实不存在：${checked} | ${probe_errors}" >> "${SUMMARY}"; MISSING=$((MISSING+1))
+                else
+                  echo "源镜像检查错误：${checked} | ${probe_errors}" >> "${SUMMARY}"; FAIL=$((FAIL+1))
+                fi
+                continue
+              fi
+              if [ "${SKIP_EXISTING}" = true ]; then
+                TARGET_PROBE_FILE="${RUNNER_TEMP}/crane-target-probe.txt"
+                if crane manifest "${target_ref}" > /dev/null 2>"${TARGET_PROBE_FILE}"; then
+                  echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"; last="${source_ref}"; SKIP=$((SKIP+1)); continue
+                fi
+                target_probe_message="$(tr '\n' ' ' < "${TARGET_PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                if [ -n "${target_probe_message}" ] && ! printf '%s' "${target_probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                  echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
+                fi
+              fi
               if crane copy "${source_ref}" "${target_ref}"; then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); else echo "失败 ${source_ref}" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
             done < "${TAG_FILE}"
             if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
