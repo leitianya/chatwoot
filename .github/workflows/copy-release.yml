@@ -208,6 +208,7 @@ jobs:
       END_DATE: ${{ inputs.end_date }}
       FROM_TAG: ${{ inputs.from_tag }}
       TO_TAG: ${{ inputs.to_tag }}
+      IMAGE_MAPPINGS: ${{ inputs.image_mappings }}
     steps:
       - name: 验证任务选择
         shell: bash
@@ -396,14 +397,53 @@ jobs:
           set -euo pipefail
           OUT="${RUNNER_TEMP}/docker-direct-versions.json"
           REQUESTED="${RUNNER_TEMP}/docker-direct-tags.txt"
+          :>"${REQUESTED}"
+
+          # none 模式允许每个 image_mappings 源镜像自带独立 Tag。
+          # 所有映射都自带 Tag 时，公共 tag/tag_list 可以为空，先放一个内部占位版本，
+          # copy-docker 会对每条映射使用其自身 Tag，不会交叉组合。
+          EMBEDDED_TOTAL=0
+          MAPPING_TOTAL=0
+          if [ -n "${IMAGE_MAPPINGS}" ]; then
+            while IFS= read -r item; do
+              item="$(printf '%s' "${item}" | xargs)"; [ -n "${item}" ] || continue
+              mapping="${item%%|*}"
+              if [[ "${mapping}" == *"="* ]]; then src="${mapping%%=*}"; else src="${mapping}"; fi
+              src="$(printf '%s' "${src}" | xargs)"
+              MAPPING_TOTAL=$((MAPPING_TOTAL+1))
+              last="${src##*/}"
+              if [[ "${last}" == *:* ]]; then EMBEDDED_TOTAL=$((EMBEDDED_TOTAL+1)); fi
+            done < <(printf '%s\n' "${IMAGE_MAPPINGS}" | sed 's/；/;/g; s/;/\n/g' | sed '/^[[:space:]]*$/d')
+          fi
+
           case "${COPY_MODE}" in
             single)
-              [ -n "${SINGLE_TAG}" ] || { echo "::error::none + single 必须填写 tag，例如 v8.0.45"; exit 1; }
-              printf '%s\n' "${SINGLE_TAG}" > "${REQUESTED}"
+              if [ -n "${SINGLE_TAG}" ]; then
+                printf '%s\n' "${SINGLE_TAG}" > "${REQUESTED}"
+              elif [ -n "${TAG_LIST}" ]; then
+                echo "single 未填写 tag，但 tag_list 有内容，自动按多个公共 Tag 处理。"
+                printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
+              elif [ "${MAPPING_TOTAL}" -gt 0 ] && [ "${EMBEDDED_TOTAL}" -eq "${MAPPING_TOTAL}" ]; then
+                printf '%s\n' '__mapping_tag__' > "${REQUESTED}"
+                echo "所有 Docker 映射均自带独立 Tag，公共 tag/tag_list 允许为空。"
+              else
+                echo "::error::none + single 必须填写 tag，或者确保每个 Docker 源地址都自带 Tag"
+                exit 1
+              fi
               ;;
             multiple)
-              [ -n "${TAG_LIST}" ] || { echo "::error::none + multiple 必须填写 tag_list"; exit 1; }
-              printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
+              if [ -n "${TAG_LIST}" ]; then
+                printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
+              elif [ -n "${SINGLE_TAG}" ]; then
+                printf '%s\n' "${SINGLE_TAG}" > "${REQUESTED}"
+                echo "multiple 未填写 tag_list，但 tag 有内容，自动按单个公共 Tag 处理。"
+              elif [ "${MAPPING_TOTAL}" -gt 0 ] && [ "${EMBEDDED_TOTAL}" -eq "${MAPPING_TOTAL}" ]; then
+                printf '%s\n' '__mapping_tag__' > "${REQUESTED}"
+                echo "所有 Docker 映射均自带独立 Tag，公共 tag/tag_list 允许为空。"
+              else
+                echo "::error::none + multiple 必须填写 tag_list，或者确保每个 Docker 源地址都自带 Tag"
+                exit 1
+              fi
               ;;
             *)
               echo "::error::none 模式仅支持 single 或 multiple"
@@ -1253,7 +1293,29 @@ jobs:
               src="$(printf '%s' "${src}"|xargs)"; name="$(printf '%s' "${name}"|xargs)"
               [ -n "${src}" ] && [ -n "${name}" ] || { echo "::error::Docker 映射格式错误：${mapping}"; exit 1; }
               [[ "${src}" != *"@"* ]] || { echo "::error::源镜像不能包含 Digest"; exit 1; }
-              printf '%s\t%s\n' "${src,,}" "${name,,}" >> "${MAP}"
+
+              mapping_tag=""
+              source_last="${src##*/}"
+              if [[ "${source_last}" == *:* ]]; then
+                mapping_tag="${source_last##*:}"
+                src="${src%:*}"
+                [ -n "${mapping_tag}" ] || { echo "::error::源镜像 Tag 不能为空：${mapping}"; exit 1; }
+              fi
+
+              # 补全 Docker Hub 短地址：redis -> docker.io/library/redis；
+              # pgvector/pgvector -> docker.io/pgvector/pgvector。
+              first_part="${src%%/*}"
+              if [[ "${src}" != */* ]]; then
+                src="docker.io/library/${src}"
+              elif [[ "${first_part}" != *.* && "${first_part}" != *:* && "${first_part}" != "localhost" ]]; then
+                src="docker.io/${src}"
+              fi
+
+              # 第三列是 Package/自动发现 Tag 列表，第四列是该手动映射独立 Tag。
+              printf '%s\t%s\t\t%s\n' "${src,,}" "${name,,}" "${mapping_tag}" >> "${MAP}"
+              if [ -n "${mapping_tag}" ]; then
+                echo "独立 Tag 映射：${src,,}:${mapping_tag} -> ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name,,}:${mapping_tag}"
+              fi
               if [ -n "${credentials}" ]; then
                 [[ "${credentials}" == *"|"* ]] || { echo "::error::账号格式应为：源=目标|用户名|Token"; exit 1; }
                 username="${credentials%%|*}"; password="${credentials#*|}"
@@ -1304,15 +1366,19 @@ jobs:
           [ "${VERSION_COUNT}" -gt 0 ] || { echo "::error::没有选中 Docker 版本"; exit 1; }
           echo "准备搬运：镜像映射 ${MAP_COUNT} 个，精准版本 ${VERSION_COUNT} 个。"
           OK=0; SKIP=0; MISSING=0; FAIL=0
-          while IFS=$'\t' read -r source_image target_name package_tags; do
+          while IFS=$'\t' read -r source_image target_name package_tags mapping_tag; do
             target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}"; last=""
             TAG_FILE="${RUNNER_TEMP}/tags-$(printf '%s' "${target_name}" | tr '/:' '--').txt"
-            if [ -n "${package_tags:-}" ]; then
+            if [ -n "${mapping_tag:-}" ]; then
+              printf '%s\n' "${mapping_tag}" > "${TAG_FILE}"
+              echo "${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
+            elif [ -n "${package_tags:-}" ]; then
               printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
               echo "${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
             else
-              jq -r '.[].tagName' "${VERSIONS}" > "${TAG_FILE}"
-              echo "${source_image} 使用 Release/clean_snapshot 版本列表。"
+              jq -r '.[].tagName | select(. != "__mapping_tag__")' "${VERSIONS}" > "${TAG_FILE}"
+              [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 没有独立 Tag，也没有公共 tag/tag_list"; FAIL=$((FAIL+1)); continue; }
+              echo "${source_image} 使用 Release/clean_snapshot 或公共版本列表。"
             fi
             while IFS= read -r release_tag; do
               [ -n "${release_tag}" ] || continue
